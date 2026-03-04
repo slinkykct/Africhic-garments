@@ -10,11 +10,55 @@ const PORT = process.env.PORT || 3001;
 const JWT  = process.env.JWT_SECRET || 'africhic_secret_2025';
 
 // ── DATABASE
+const RAW_DB_URL = process.env.DATABASE_URL || '';
+
+// Validate DATABASE_URL looks like a real connection string
+if (!RAW_DB_URL || !RAW_DB_URL.startsWith('postgres')) {
+  console.error('');
+  console.error('❌ FATAL: DATABASE_URL is missing or invalid.');
+  console.error('   Current value: "' + RAW_DB_URL + '"');
+  console.error('');
+  console.error('   Fix on Railway:');
+  console.error('   1. Go to your backend service → Variables tab');
+  console.error('   2. Set DATABASE_URL to your full Neon/Postgres connection string');
+  console.error('   3. It must start with: postgresql:// or postgres://');
+  console.error('   Example: postgresql://user:pass@ep-xxx.neon.tech/neondb?sslmode=require');
+  console.error('');
+  process.exit(1);
+}
+
+// Auto-detect local vs hosted to set SSL correctly
+const isLocal = RAW_DB_URL.includes('localhost') || RAW_DB_URL.includes('127.0.0.1');
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  connectionString: RAW_DB_URL,
+  ssl: isLocal ? false : { rejectUnauthorized: false }
 });
-pool.query('SELECT 1').then(() => console.log('✅ DB connected')).catch(e => console.error('DB error:', e.message));
+
+pool.query('SELECT 1')
+  .then(async () => {
+    console.log('✅ DB connected');
+    // On first boot: auto-set admin password if placeholder was inserted by SQL seed
+    try {
+      const { rows } = await pool.query("SELECT id,password FROM users WHERE email='admin@africhic.co.za'");
+      if (rows.length && rows[0].password.includes('placeholder')) {
+        const pw = process.env.ADMIN_PASSWORD || 'Africhic@Admin2025';
+        const hash = await bcrypt.hash(pw, 10);
+        await pool.query('UPDATE users SET password=$1 WHERE email=$2', [hash, 'admin@africhic.co.za']);
+        console.log('✅ Admin password set — login: admin@africhic.co.za / ' + pw);
+      }
+    } catch(e) { /* table not yet created — run database.sql first */ }
+  })
+  .catch(e => {
+    console.error('');
+    console.error('❌ DB connection failed: ' + e.message);
+    console.error('');
+    console.error('   Common causes:');
+    console.error('   - DATABASE_URL is wrong or incomplete');
+    console.error('   - Neon database is paused (visit console.neon.tech → Resume)');
+    console.error('   - IP/firewall blocking the connection');
+    console.error('');
+    process.exit(1);
+  });
 
 // ── MIDDLEWARE
 app.use(cors({ origin: '*', credentials: true }));
