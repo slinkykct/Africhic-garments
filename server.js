@@ -10,59 +10,26 @@ const PORT = process.env.PORT || 3001;
 const JWT  = process.env.JWT_SECRET || 'africhic_secret_2025';
 
 // ── DATABASE
-const RAW_DB_URL = process.env.DATABASE_URL || '';
-
-// Validate DATABASE_URL looks like a real connection string
-if (!RAW_DB_URL || !RAW_DB_URL.startsWith('postgres')) {
-  console.error('');
-  console.error('❌ FATAL: DATABASE_URL is missing or invalid.');
-  console.error('   Current value: "' + RAW_DB_URL + '"');
-  console.error('');
-  console.error('   Fix on Railway:');
-  console.error('   1. Go to your backend service → Variables tab');
-  console.error('   2. Set DATABASE_URL to your full Neon/Postgres connection string');
-  console.error('   3. It must start with: postgresql:// or postgres://');
-  console.error('   Example: postgresql://user:pass@ep-xxx.neon.tech/neondb?sslmode=require');
-  console.error('');
-  process.exit(1);
-}
-
-// Auto-detect local vs hosted to set SSL correctly
-const isLocal = RAW_DB_URL.includes('localhost') || RAW_DB_URL.includes('127.0.0.1');
 const pool = new Pool({
-  connectionString: RAW_DB_URL,
-  ssl: isLocal ? false : { rejectUnauthorized: false }
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
 });
-
-pool.query('SELECT 1')
-  .then(async () => {
-    console.log('✅ DB connected');
-    // On first boot: auto-set admin password if placeholder was inserted by SQL seed
-    try {
-      const { rows } = await pool.query("SELECT id,password FROM users WHERE email='admin@africhic.co.za'");
-      if (rows.length && rows[0].password.includes('placeholder')) {
-        const pw = process.env.ADMIN_PASSWORD || 'Africhic@Admin2025';
-        const hash = await bcrypt.hash(pw, 10);
-        await pool.query('UPDATE users SET password=$1 WHERE email=$2', [hash, 'admin@africhic.co.za']);
-        console.log('✅ Admin password set — login: admin@africhic.co.za / ' + pw);
-      }
-    } catch(e) { /* table not yet created — run database.sql first */ }
-  })
-  .catch(e => {
-    console.error('');
-    console.error('❌ DB connection failed: ' + e.message);
-    console.error('');
-    console.error('   Common causes:');
-    console.error('   - DATABASE_URL is wrong or incomplete');
-    console.error('   - Neon database is paused (visit console.neon.tech → Resume)');
-    console.error('   - IP/firewall blocking the connection');
-    console.error('');
-    process.exit(1);
-  });
+pool.query('SELECT 1').then(() => console.log('✅ DB connected')).catch(e => console.error('DB error:', e.message));
+// Keepalive — prevents Neon cold starts (pings every 4 min)
+setInterval(() => pool.query('SELECT 1').catch(() => {}), 4 * 60 * 1000);
 
 // ── MIDDLEWARE
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
 
 // ── AUTH HELPERS
 const sign  = u => jwt.sign({ id: u.id, email: u.email, role: u.role }, JWT, { expiresIn: '7d' });
@@ -333,7 +300,8 @@ app.put('/api/admin/products/:id', admin, async (req, res) => {
     await client.query('BEGIN');
     await client.query('UPDATE products SET name=$1,category_id=$2,description=$3,price=$4,original_price=$5,badge=$6,sizes=$7,stock=$8,active=$9,updated_at=NOW() WHERE id=$10',
       [name,categoryId,description,price,originalPrice||null,badge||'',sizes||[],stock,active!==false,req.params.id]);
-    if (images!==undefined) {
+    // Only replace images if the field was sent AND contains actual URLs
+    if (Array.isArray(images) && images.length > 0) {
       await client.query('DELETE FROM product_images WHERE product_id=$1',[req.params.id]);
       for (let i=0;i<images.length;i++) await client.query('INSERT INTO product_images (product_id,url,sort_order) VALUES ($1,$2,$3)',[req.params.id,images[i],i]);
     }
