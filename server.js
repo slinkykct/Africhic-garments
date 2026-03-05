@@ -10,20 +10,33 @@ const PORT = process.env.PORT || 3001;
 const JWT  = process.env.JWT_SECRET || 'africhic_secret_2025';
 
 // ── DATABASE
+// Append sslmode=require to the connection string so pg uses libpq semantics
+// This silences the "prefer/require treated as verify-full" security warning
+const rawDb = process.env.DATABASE_URL || '';
+const DB_URL = rawDb.includes('sslmode=')
+  ? rawDb
+  : rawDb + (rawDb.includes('?') ? '&' : '?') + 'sslmode=require';
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DB_URL,
   ssl: { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000
 });
-pool.query('SELECT 1').then(() => console.log('✅ DB connected')).catch(e => console.error('DB error:', e.message));
-// Keepalive — prevents Neon cold starts (pings every 4 min)
+
+pool.query('SELECT 1')
+  .then(() => console.log('✅ DB connected'))
+  .catch(e => console.error('❌ DB error:', e.message));
+
+// Keep Neon DB warm — prevents cold start delays (pings every 4 minutes)
 setInterval(() => pool.query('SELECT 1').catch(() => {}), 4 * 60 * 1000);
 
 // ── MIDDLEWARE
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
+
+// Prevent CDN/browser caching of API responses so admin changes sync instantly
 app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
