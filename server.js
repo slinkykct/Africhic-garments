@@ -406,15 +406,18 @@ app.patch('/api/admin/promos/:id', admin, async (req, res) => {
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin image upload (base64 → stores URL in DB, file hosted on Netlify)
+// Admin image upload
 app.post('/api/admin/upload', admin, async (req, res) => {
   try {
-    // On Railway filesystem is ephemeral — return the base64 as data URL
-    // For production, integrate Cloudinary or similar
     const { base64, filename } = req.body;
     if (!base64) return res.status(400).json({ error: 'No image data' });
-    // Return the base64 as a usable image URL
-    res.json({ url: base64, note: 'Stored as base64. For permanent storage integrate Cloudinary.' });
+    // Validate it's a proper data URL
+    if (!base64.startsWith('data:image/')) {
+      return res.status(400).json({ error: 'Invalid image format' });
+    }
+    // Return the full base64 data URL — works as CSS background-image and <img src>
+    // The hero_slides.image and product_images.url columns are TEXT so no length limit
+    res.json({ url: base64 });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
