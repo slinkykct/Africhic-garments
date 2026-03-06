@@ -10,39 +10,26 @@ const PORT = process.env.PORT || 3001;
 const JWT  = process.env.JWT_SECRET || 'africhic_secret_2025';
 
 // ── DATABASE
-// Append sslmode=require to the connection string so pg uses libpq semantics
-// This silences the "prefer/require treated as verify-full" security warning
-const rawDb = process.env.DATABASE_URL || '';
-const DB_URL = rawDb.includes('sslmode=')
-  ? rawDb
-  : rawDb + (rawDb.includes('?') ? '&' : '?') + 'sslmode=require';
+// Append uselibpqcompat=true to silence pg SSL warning and adopt standard libpq semantics
+const _db = process.env.DATABASE_URL || '';
+const DB_URL = _db.includes('uselibpqcompat')
+  ? _db
+  : _db + (_db.includes('?') ? '&' : '?') + 'uselibpqcompat=true&sslmode=require';
 
 const pool = new Pool({
   connectionString: DB_URL,
-  ssl: { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000
 });
 
-pool.query('SELECT 1')
-  .then(() => console.log('✅ DB connected'))
-  .catch(e => console.error('❌ DB error:', e.message));
-
-// Keep Neon DB warm — prevents cold start delays (pings every 4 minutes)
+// Keep Neon warm — prevents 5-10s cold start delays (pings every 4 min)
 setInterval(() => pool.query('SELECT 1').catch(() => {}), 4 * 60 * 1000);
+pool.query('SELECT 1').then(() => console.log('✅ DB connected')).catch(e => console.error('DB error:', e.message));
 
 // ── MIDDLEWARE
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
-
-// Prevent CDN/browser caching of API responses so admin changes sync instantly
-app.use((req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.set('Pragma', 'no-cache');
-  res.set('Expires', '0');
-  next();
-});
 
 // ── AUTH HELPERS
 const sign  = u => jwt.sign({ id: u.id, email: u.email, role: u.role }, JWT, { expiresIn: '7d' });
@@ -313,8 +300,7 @@ app.put('/api/admin/products/:id', admin, async (req, res) => {
     await client.query('BEGIN');
     await client.query('UPDATE products SET name=$1,category_id=$2,description=$3,price=$4,original_price=$5,badge=$6,sizes=$7,stock=$8,active=$9,updated_at=NOW() WHERE id=$10',
       [name,categoryId,description,price,originalPrice||null,badge||'',sizes||[],stock,active!==false,req.params.id]);
-    // Only replace images if the field was sent AND contains actual URLs
-    if (Array.isArray(images) && images.length > 0) {
+    if (images!==undefined) {
       await client.query('DELETE FROM product_images WHERE product_id=$1',[req.params.id]);
       for (let i=0;i<images.length;i++) await client.query('INSERT INTO product_images (product_id,url,sort_order) VALUES ($1,$2,$3)',[req.params.id,images[i],i]);
     }
@@ -406,18 +392,15 @@ app.patch('/api/admin/promos/:id', admin, async (req, res) => {
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin image upload
+// Admin image upload (base64 → stores URL in DB, file hosted on Netlify)
 app.post('/api/admin/upload', admin, async (req, res) => {
   try {
+    // On Railway filesystem is ephemeral — return the base64 as data URL
+    // For production, integrate Cloudinary or similar
     const { base64, filename } = req.body;
     if (!base64) return res.status(400).json({ error: 'No image data' });
-    // Validate it's a proper data URL
-    if (!base64.startsWith('data:image/')) {
-      return res.status(400).json({ error: 'Invalid image format' });
-    }
-    // Return the full base64 data URL — works as CSS background-image and <img src>
-    // The hero_slides.image and product_images.url columns are TEXT so no length limit
-    res.json({ url: base64 });
+    // Return the base64 as a usable image URL
+    res.json({ url: base64, note: 'Stored as base64. For permanent storage integrate Cloudinary.' });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
