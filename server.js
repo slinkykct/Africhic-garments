@@ -9,13 +9,13 @@ const app  = express();
 const PORT = process.env.PORT || 3001;
 const JWT  = process.env.JWT_SECRET || 'africhic_secret_2025';
 
-// ── DATABASE
+// ── DATABASE (SSL fix + keepalive)
 const _db = process.env.DATABASE_URL || '';
 const DB_URL = _db.includes('uselibpqcompat') ? _db
   : _db + (_db.includes('?') ? '&' : '?') + 'uselibpqcompat=true&sslmode=require';
-const pool = new Pool({ connectionString: DB_URL, max:10, idleTimeoutMillis:30000, connectionTimeoutMillis:5000 });
-pool.query('SELECT 1').then(()=>console.log('✅ DB connected')).catch(e=>console.error('DB error:',e.message));
-setInterval(()=>pool.query('SELECT 1').catch(()=>{}), 4*60*1000);
+const pool = new Pool({ connectionString: DB_URL, max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 });
+pool.query('SELECT 1').then(() => console.log('✅ DB connected')).catch(e => console.error('DB error:', e.message));
+setInterval(() => pool.query('SELECT 1').catch(() => {}), 4 * 60 * 1000);
 
 // ── MIDDLEWARE
 app.use(cors({ origin: '*', credentials: true }));
@@ -83,7 +83,7 @@ app.get('/api/products', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Single product by slug or id
+// Single product
 app.get('/api/products/:slug', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -137,18 +137,18 @@ app.get('/api/auth/me', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Setup admin password (run once after deploy)
+// Setup admin
 app.post('/api/setup', async (req, res) => {
   try {
     const { secret, password } = req.body;
     if (secret !== (process.env.SETUP_SECRET || 'africhic-setup-2025')) return res.status(403).json({ error: 'Invalid secret' });
     const hash = await bcrypt.hash(password || 'Africhic@Admin2025', 10);
     await pool.query('UPDATE users SET password=$1 WHERE email=$2', [hash, 'admin@africhic.co.za']);
-    res.json({ success: true, message: 'Admin password set — you can now login' });
+    res.json({ success: true, message: 'Admin password set' });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Create order
+// Create order — seeds first tracking event automatically
 app.post('/api/orders', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -168,25 +168,33 @@ app.post('/api/orders', async (req, res) => {
         [o.id,item.productId,item.name,item.image,item.size,item.price,item.qty]);
       await client.query('UPDATE products SET stock=GREATEST(0,stock-$1) WHERE id=$2', [item.qty,item.productId]);
     }
+    // Auto-seed first tracking event
+    await client.query(
+      'INSERT INTO order_tracking (order_id, status, message) VALUES ($1,$2,$3)',
+      [o.id, 'pending', 'Your order has been received and is awaiting processing. Thank you for shopping with Africhic! ✦']
+    );
     await client.query('COMMIT');
     res.json({ orderNumber: num, orderId: o.id });
   } catch(e) { await client.query('ROLLBACK'); res.status(500).json({ error: e.message }); }
   finally { client.release(); }
 });
 
-// My orders (with tracking timeline)
+// My orders — with tracking (subquery avoids DISTINCT+ORDER BY PostgreSQL error)
 app.get('/api/my/orders', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT o.*,
         (SELECT COALESCE(json_agg(x ORDER BY x_order), '[]') FROM (
-          SELECT json_build_object('id',oi.id,'name',oi.product_name,'image',oi.product_image,
-            'size',oi.size,'price',oi.price,'qty',oi.qty) AS x, oi.id AS x_order
+          SELECT json_build_object(
+            'id',oi.id,'name',oi.product_name,'image',oi.product_image,
+            'size',oi.size,'price',oi.price,'qty',oi.qty
+          ) AS x, oi.id AS x_order
           FROM order_items oi WHERE oi.order_id=o.id
         ) t) AS items,
-        (SELECT COALESCE(json_agg(x ORDER BY x_order), '[]') FROM (
-          SELECT json_build_object('id',ot.id,'status',ot.status,'message',ot.message,
-            'created_at',ot.created_at) AS x, ot.created_at AS x_order
+        (SELECT COALESCE(json_agg(x ORDER BY x_ts), '[]') FROM (
+          SELECT json_build_object(
+            'id',ot.id,'status',ot.status,'message',ot.message,'created_at',ot.created_at
+          ) AS x, ot.created_at AS x_ts
           FROM order_tracking ot WHERE ot.order_id=o.id
         ) t) AS tracking
       FROM orders o
@@ -194,6 +202,40 @@ app.get('/api/my/orders', auth, async (req, res) => {
       ORDER BY o.created_at DESC
     `, [req.user.id]);
     res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Public order tracking — order_number + email, no login needed
+app.get('/api/track', async (req, res) => {
+  try {
+    const { order_number, email } = req.query;
+    if (!order_number || !email) return res.status(400).json({ error: 'Order number and email required' });
+    const { rows } = await pool.query(`
+      SELECT o.order_number, o.status, o.created_at, o.total, o.delivery_method,
+             o.tracking_number, o.courier, o.estimated_delivery,
+             o.ship_first_name, o.ship_last_name, o.ship_city, o.ship_province,
+        (SELECT COALESCE(json_agg(x ORDER BY x_id), '[]') FROM (
+          SELECT json_build_object(
+            'id',oi.id,'name',oi.product_name,'image',oi.product_image,
+            'size',oi.size,'price',oi.price,'qty',oi.qty
+          ) AS x, oi.id AS x_id
+          FROM order_items oi WHERE oi.order_id=o.id
+        ) t) AS items,
+        (SELECT COALESCE(json_agg(x ORDER BY x_ts), '[]') FROM (
+          SELECT json_build_object(
+            'id',ot.id,'status',ot.status,'message',ot.message,'created_at',ot.created_at
+          ) AS x, ot.created_at AS x_ts
+          FROM order_tracking ot WHERE ot.order_id=o.id AND ot.is_public=true
+        ) t) AS tracking
+      FROM orders o
+      WHERE UPPER(o.order_number)=UPPER($1)
+        AND (
+          LOWER(COALESCE(o.guest_email,''))=LOWER($2)
+          OR o.user_id IN (SELECT id FROM users WHERE LOWER(email)=LOWER($2))
+        )
+    `, [order_number.trim(), email.trim()]);
+    if (!rows.length) return res.status(404).json({ error: 'Order not found. Please check your order number and email.' });
+    res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -239,7 +281,7 @@ app.get('/api/admin/stats', admin, async (_, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin orders
+// Admin orders list
 app.get('/api/admin/orders', admin, async (req, res) => {
   try {
     const { status, limit=50 } = req.query;
@@ -256,6 +298,34 @@ app.get('/api/admin/orders', admin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Admin: full order detail — items + tracking timeline
+app.get('/api/admin/orders/:id', admin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT o.*, u.email AS customer_email, u.first_name, u.last_name, u.phone,
+        (SELECT COALESCE(json_agg(x ORDER BY x_id), '[]') FROM (
+          SELECT json_build_object(
+            'id',oi.id,'name',oi.product_name,'image',oi.product_image,
+            'size',oi.size,'price',oi.price,'qty',oi.qty
+          ) AS x, oi.id AS x_id
+          FROM order_items oi WHERE oi.order_id=o.id
+        ) t) AS items,
+        (SELECT COALESCE(json_agg(x ORDER BY x_ts), '[]') FROM (
+          SELECT json_build_object(
+            'id',ot.id,'status',ot.status,'message',ot.message,'created_at',ot.created_at
+          ) AS x, ot.created_at AS x_ts
+          FROM order_tracking ot WHERE ot.order_id=o.id
+        ) t) AS tracking
+      FROM orders o
+      LEFT JOIN users u ON u.id=o.user_id
+      WHERE o.id=$1
+    `, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Admin: update order status + log tracking event atomically
 app.patch('/api/admin/orders/:id/status', admin, async (req, res) => {
   try {
     const valid = ['pending','processing','shipped','delivered','cancelled'];
@@ -264,24 +334,21 @@ app.patch('/api/admin/orders/:id/status', admin, async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      // Build UPDATE dynamically but safely
+      // Build SET clause dynamically — only include provided optional fields
       const setClauses = ['status=$1', 'updated_at=NOW()'];
       const params = [status, req.params.id];
       if (trackingNumber) { params.push(trackingNumber); setClauses.push(`tracking_number=$${params.length}`); }
       if (courier)        { params.push(courier);        setClauses.push(`courier=$${params.length}`); }
       if (estimatedDelivery) { params.push(estimatedDelivery); setClauses.push(`estimated_delivery=$${params.length}`); }
-      await client.query(
-        `UPDATE orders SET ${setClauses.join(',')} WHERE id=$2`,
-        params
-      );
+      await client.query(`UPDATE orders SET ${setClauses.join(',')} WHERE id=$2`, params);
       const defaultMsg = {
         pending:    'Your order has been received and is awaiting processing.',
-        processing: 'Your order is being carefully prepared and packed.',
+        processing: 'Great news — your order is being carefully prepared and packed.',
         shipped:    trackingNumber
-          ? 'Your order has been shipped. Tracking: '+trackingNumber+(courier?' via '+courier:'')
+          ? 'Your order has been shipped! Tracking: ' + trackingNumber + (courier ? ' via ' + courier : '') + '.'
           : 'Your order has been shipped and is on its way!',
         delivered:  'Your order has been delivered. Thank you for shopping with Africhic! ✦',
-        cancelled:  'Your order has been cancelled. Please contact us if you have questions.'
+        cancelled:  'Your order has been cancelled. Please contact us if you have any questions.'
       };
       await client.query(
         'INSERT INTO order_tracking (order_id, status, message, created_by) VALUES ($1,$2,$3,$4)',
@@ -294,7 +361,7 @@ app.patch('/api/admin/orders/:id/status', admin, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: send a message on an order without changing status
+// Admin: add a message without changing status
 app.post('/api/admin/orders/:id/message', admin, async (req, res) => {
   try {
     const { message } = req.body;
@@ -306,59 +373,6 @@ app.post('/api/admin/orders/:id/message', admin, async (req, res) => {
       [req.params.id, rows[0].status, message.trim(), req.user.id]
     );
     res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Admin: full order detail with items + tracking timeline
-app.get('/api/admin/orders/:id', admin, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT o.*, u.email AS customer_email, u.first_name, u.last_name, u.phone,
-        (SELECT COALESCE(json_agg(x ORDER BY x_id), '[]') FROM (
-          SELECT json_build_object('id',oi.id,'name',oi.product_name,'image',oi.product_image,
-            'size',oi.size,'price',oi.price,'qty',oi.qty) AS x, oi.id AS x_id
-          FROM order_items oi WHERE oi.order_id=o.id
-        ) t) AS items,
-        (SELECT COALESCE(json_agg(x ORDER BY x_ts), '[]') FROM (
-          SELECT json_build_object('id',ot.id,'status',ot.status,'message',ot.message,
-            'created_at',ot.created_at) AS x, ot.created_at AS x_ts
-          FROM order_tracking ot WHERE ot.order_id=o.id
-        ) t) AS tracking
-      FROM orders o
-      LEFT JOIN users u ON u.id=o.user_id
-      WHERE o.id=$1
-    `, [req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: 'Not found' });
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Public order tracking — no auth, requires order_number + email
-app.get('/api/track', async (req, res) => {
-  try {
-    const { order_number, email } = req.query;
-    if (!order_number || !email) return res.status(400).json({ error: 'Order number and email required' });
-    const { rows } = await pool.query(`
-      SELECT o.order_number, o.status, o.created_at, o.total, o.delivery_method,
-             o.tracking_number, o.courier, o.estimated_delivery,
-             o.ship_first_name, o.ship_last_name, o.ship_city, o.ship_province,
-        (SELECT COALESCE(json_agg(x ORDER BY x_id), '[]') FROM (
-          SELECT json_build_object('id',oi.id,'name',oi.product_name,'image',oi.product_image,
-            'size',oi.size,'price',oi.price,'qty',oi.qty) AS x, oi.id AS x_id
-          FROM order_items oi WHERE oi.order_id=o.id
-        ) t) AS items,
-        (SELECT COALESCE(json_agg(x ORDER BY x_ts), '[]') FROM (
-          SELECT json_build_object('id',ot.id,'status',ot.status,'message',ot.message,
-            'created_at',ot.created_at) AS x, ot.created_at AS x_ts
-          FROM order_tracking ot WHERE ot.order_id=o.id AND ot.is_public=true
-        ) t) AS tracking
-      FROM orders o
-      WHERE UPPER(o.order_number)=UPPER($1)
-        AND (LOWER(o.guest_email)=LOWER($2)
-          OR o.user_id IN (SELECT id FROM users WHERE LOWER(email)=LOWER($2)))
-    `, [order_number.trim(), email.trim()]);
-    if (!rows.length) return res.status(404).json({ error: 'Order not found. Please check your order number and email.' });
-    res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -385,7 +399,8 @@ app.post('/api/admin/products', admin, async (req, res) => {
       'INSERT INTO products (name,slug,category_id,description,price,original_price,badge,sizes,stock) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
       [name,slug,categoryId,description,price,originalPrice||null,badge||'',sizes||[],stock||0]
     );
-    if (images?.length) for (let i=0;i<images.length;i++) await client.query('INSERT INTO product_images (product_id,url,sort_order) VALUES ($1,$2,$3)',[p.id,images[i],i]);
+    if (Array.isArray(images) && images.length)
+      for (let i=0;i<images.length;i++) await client.query('INSERT INTO product_images (product_id,url,sort_order) VALUES ($1,$2,$3)',[p.id,images[i],i]);
     await client.query('COMMIT'); res.json(p);
   } catch(e) { await client.query('ROLLBACK'); res.status(500).json({ error: e.message }); }
   finally { client.release(); }
@@ -398,7 +413,7 @@ app.put('/api/admin/products/:id', admin, async (req, res) => {
     await client.query('BEGIN');
     await client.query('UPDATE products SET name=$1,category_id=$2,description=$3,price=$4,original_price=$5,badge=$6,sizes=$7,stock=$8,active=$9,updated_at=NOW() WHERE id=$10',
       [name,categoryId,description,price,originalPrice||null,badge||'',sizes||[],stock,active!==false,req.params.id]);
-    if (Array.isArray(images) && images.length > 0) {
+    if (Array.isArray(images) && images.length) {
       await client.query('DELETE FROM product_images WHERE product_id=$1',[req.params.id]);
       for (let i=0;i<images.length;i++) await client.query('INSERT INTO product_images (product_id,url,sort_order) VALUES ($1,$2,$3)',[req.params.id,images[i],i]);
     }
@@ -490,15 +505,12 @@ app.patch('/api/admin/promos/:id', admin, async (req, res) => {
   catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin image upload (base64 → stores URL in DB, file hosted on Netlify)
+// Admin image upload
 app.post('/api/admin/upload', admin, async (req, res) => {
   try {
-    // On Railway filesystem is ephemeral — return the base64 as data URL
-    // For production, integrate Cloudinary or similar
-    const { base64, filename } = req.body;
+    const { base64 } = req.body;
     if (!base64) return res.status(400).json({ error: 'No image data' });
-    // Return the base64 as a usable image URL
-    res.json({ url: base64, note: 'Stored as base64. For permanent storage integrate Cloudinary.' });
+    res.json({ url: base64 });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
