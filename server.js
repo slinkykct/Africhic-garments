@@ -17,6 +17,108 @@ const pool = new Pool({ connectionString: DB_URL, max: 10, idleTimeoutMillis: 30
 pool.query('SELECT 1').then(() => console.log('✅ DB connected')).catch(e => console.error('DB error:', e.message));
 setInterval(() => pool.query('SELECT 1').catch(() => {}), 4 * 60 * 1000);
 
+
+// ── EMAIL NOTIFICATIONS (Nodemailer — set SMTP_* env vars in Railway)
+let transporter = null;
+try {
+  const nodemailer = require('nodemailer');
+  if (process.env.SMTP_HOST && process.env.SMTP_USER) {
+    transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT)||587,
+      secure: process.env.SMTP_SECURE==='true',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    });
+    console.log('✅ Email configured via', process.env.SMTP_HOST);
+  } else {
+    console.log('⚠️  No SMTP config — emails disabled. Set SMTP_HOST, SMTP_USER, SMTP_PASS in Railway env.');
+  }
+} catch(e) { console.log('⚠️  nodemailer not installed — run: npm install nodemailer'); }
+
+const STORE_EMAIL = process.env.STORE_EMAIL || 'admin@africhic.co.za';
+const STORE_NAME  = 'Africhic Garments';
+const SITE_URL    = process.env.SITE_URL || 'https://africhicgarmentshoponline.netlify.app';
+
+const STATUS_SUBJECT = {
+  pending:    '✦ Order Received — {num}',
+  processing: '📦 Order Being Prepared — {num}',
+  shipped:    '🚚 Your Order is On Its Way — {num}',
+  delivered:  '✅ Order Delivered — {num}',
+  cancelled:  'Order Cancelled — {num}'
+};
+
+function emailTemplate(title, body, orderNum, trackingNum) {
+  const trackLink = `${SITE_URL}/track.html?order=${orderNum}`;
+  return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>body{margin:0;padding:0;background:#f5f0e8;font-family:'Helvetica Neue',Arial,sans-serif}
+.wrap{max-width:560px;margin:30px auto;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,.08)}
+.hdr{background:#3d2b1f;padding:28px 32px;text-align:center}
+.hdr h1{color:#fff;font-size:1.5rem;font-weight:300;margin:0;letter-spacing:.05em}
+.hdr p{color:rgba(255,255,255,.6);font-size:.75rem;margin:4px 0 0;letter-spacing:.15em;text-transform:uppercase}
+.body{padding:32px}
+.body h2{font-size:1.2rem;font-weight:400;color:#3d2b1f;margin:0 0 14px}
+.body p{font-size:.88rem;line-height:1.7;color:#5a4238;margin:0 0 14px}
+.status-chip{display:inline-block;padding:6px 18px;border-radius:20px;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:18px}
+.msg-box{background:#f5f0e8;border-radius:8px;padding:16px 18px;border-left:3px solid #8b5a32;margin:16px 0}
+.msg-box p{margin:0;font-size:.86rem;color:#3d2b1f}
+.track-btn{display:block;background:#8b5a32;color:#fff !important;text-decoration:none;text-align:center;padding:14px 28px;border-radius:5px;font-size:.82rem;font-weight:500;letter-spacing:.1em;text-transform:uppercase;margin:20px 0}
+.track-btn:hover{background:#7a4e2c}
+${trackingNum?`.tn-box{background:#e8f5e9;border-radius:8px;padding:14px 18px;text-align:center;margin:14px 0}
+.tn-box p{margin:0;font-size:.8rem;color:#2e7d32}
+.tn-box strong{font-size:1.1rem;display:block;color:#1b5e20;letter-spacing:.1em}`:''}
+.ftr{background:#f5f0e8;padding:20px 32px;text-align:center;border-top:1px solid #e8ddd0}
+.ftr p{font-size:.74rem;color:#9a8070;margin:3px 0;line-height:1.6}
+</style></head>
+<body><div class="wrap">
+<div class="hdr"><h1>Afri<em>chic</em></h1><p>Garments</p></div>
+<div class="body">
+<h2>${title}</h2>
+${body}
+${trackingNum?`<div class="tn-box"><p>Your Tracking Number</p><strong>${trackingNum}</strong>${process.env.COURIER_TRACK_URL?`<p style="margin:6px 0 0"><a href="${process.env.COURIER_TRACK_URL}${trackingNum}" style="color:#2e7d32;font-size:.78rem">Track with courier →</a></p>`:''}</div>`:''}
+<a href="${trackLink}" class="track-btn">View Order Status →</a>
+</div>
+<div class="ftr">
+<p><strong>${STORE_NAME}</strong></p>
+<p>Questions? Reply to this email or visit <a href="${SITE_URL}" style="color:#8b5a32">${SITE_URL}</a></p>
+<p style="margin-top:8px;font-size:.68rem;color:#b0967e">You're receiving this because you placed an order with us.</p>
+</div>
+</div></body></html>`;
+}
+
+async function sendOrderEmail(to, subject, htmlBody) {
+  if (!transporter || !to) return;
+  try {
+    await transporter.sendMail({
+      from: `"${STORE_NAME}" <${STORE_EMAIL}>`,
+      to,
+      subject,
+      html: htmlBody
+    });
+    console.log('📧 Email sent to', to, '—', subject);
+  } catch(e) { console.error('📧 Email failed:', e.message); }
+}
+
+async function sendAdminAlert(subject, html) {
+  if (!transporter) return;
+  try {
+    await transporter.sendMail({
+      from: `"${STORE_NAME}" <${STORE_EMAIL}>`,
+      to: STORE_EMAIL,
+      subject: '[ADMIN] ' + subject,
+      html
+    });
+  } catch(e) { console.error('📧 Admin alert failed:', e.message); }
+}
+
+// Auto-generate courier tracking number
+function genTrackingNum() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let n = 'AFC';
+  for (let i=0;i<8;i++) n += chars[Math.floor(Math.random()*chars.length)];
+  return n;
+}
+
 // ── MIDDLEWARE
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
@@ -174,6 +276,22 @@ app.post('/api/orders', async (req, res) => {
       [o.id, 'pending', 'Your order has been received and is awaiting processing. Thank you for shopping with Africhic! ✦']
     );
     await client.query('COMMIT');
+    
+    // Send confirmation email (async, don't block response)
+    const customerEmail = guestEmail || (userId ? (await pool.query('SELECT email FROM users WHERE id=$1',[userId])).rows[0]?.email : null);
+    const custName = [shipping.firstName, shipping.lastName].filter(Boolean).join(' ') || 'Valued Customer';
+    const itemRows = items.map(i=>`<tr><td style="padding:6px 0;font-size:.82rem;color:#3d2b1f">${i.name} (${i.size})</td><td style="padding:6px 0;font-size:.82rem;text-align:right;color:#8b5a32">×${i.qty} — R${(i.price*i.qty).toFixed(2)}</td></tr>`).join('');
+    const confirmBody = `<p>Hi <strong>${custName}</strong>,</p>
+<p>Thank you for your order! We've received it and it's now being processed.</p>
+<div class="msg-box"><p>Your order <strong>${num}</strong> has been confirmed. You'll receive updates as it progresses.</p></div>
+<table style="width:100%;border-collapse:collapse;margin:14px 0">${itemRows}
+<tr style="border-top:2px solid #e8ddd0"><td style="padding:10px 0;font-weight:600;font-size:.88rem">Total</td><td style="padding:10px 0;font-weight:600;text-align:right;color:#8b5a32;font-size:.88rem">R${total.toFixed(2)}</td></tr></table>`;
+    sendOrderEmail(customerEmail, `✦ Order Confirmed — ${num}`, emailTemplate('Order Confirmed ✦', confirmBody, num, null));
+    
+    // Admin alert
+    sendAdminAlert(`New Order ${num} — R${total.toFixed(2)}`, 
+      `<p>New order placed: <strong>${num}</strong></p><p>Customer: ${custName} (${customerEmail||'guest'})</p><p>Total: R${total.toFixed(2)}</p><p><a href="${SITE_URL}/admin.html">View in Admin →</a></p>`);
+    
     res.json({ orderNumber: num, orderId: o.id });
   } catch(e) { await client.query('ROLLBACK'); res.status(500).json({ error: e.message }); }
   finally { client.release(); }
@@ -341,21 +459,53 @@ app.patch('/api/admin/orders/:id/status', admin, async (req, res) => {
       if (courier)        { params.push(courier);        setClauses.push(`courier=$${params.length}`); }
       if (estimatedDelivery) { params.push(estimatedDelivery); setClauses.push(`estimated_delivery=$${params.length}`); }
       await client.query(`UPDATE orders SET ${setClauses.join(',')} WHERE id=$2`, params);
+      // Auto-generate tracking number when shipping
+      let finalTrackingNum = trackingNumber;
+      if (status === 'shipped' && !finalTrackingNum) {
+        finalTrackingNum = genTrackingNum();
+        if (!setClauses.find(c=>c.includes('tracking_number'))) {
+          params.push(finalTrackingNum);
+          setClauses.push(`tracking_number=$${params.length}`);
+        }
+      }
       const defaultMsg = {
         pending:    'Your order has been received and is awaiting processing.',
         processing: 'Great news — your order is being carefully prepared and packed.',
-        shipped:    trackingNumber
-          ? 'Your order has been shipped! Tracking: ' + trackingNumber + (courier ? ' via ' + courier : '') + '.'
-          : 'Your order has been shipped and is on its way!',
+        shipped:    'Your order has been shipped! Tracking: ' + (finalTrackingNum||'') + (courier ? ' via ' + courier : '') + '. Estimated delivery in 2–5 business days.',
         delivered:  'Your order has been delivered. Thank you for shopping with Africhic! ✦',
         cancelled:  'Your order has been cancelled. Please contact us if you have any questions.'
       };
+      const finalMsg = message || defaultMsg[status];
       await client.query(
         'INSERT INTO order_tracking (order_id, status, message, created_by) VALUES ($1,$2,$3,$4)',
-        [req.params.id, status, message || defaultMsg[status], req.user.id]
+        [req.params.id, status, finalMsg, req.user.id]
       );
       await client.query('COMMIT');
-      res.json({ success: true });
+      
+      // Send email notification to customer
+      const orderRow = await pool.query(
+        'SELECT o.*, u.email AS uemail, o.guest_email FROM orders o LEFT JOIN users u ON u.id=o.user_id WHERE o.id=$1',
+        [req.params.id]
+      );
+      if (orderRow.rows.length) {
+        const or = orderRow.rows[0];
+        const toEmail = or.uemail || or.guest_email;
+        const custName = [or.ship_first_name, or.ship_last_name].filter(Boolean).join(' ') || 'Valued Customer';
+        const subj = (STATUS_SUBJECT[status]||'Order Update — {num}').replace('{num}', or.order_number);
+        const statusColors = {pending:'#856404',processing:'#004085',shipped:'#155724',delivered:'#155724',cancelled:'#721c24'};
+        const statusBg = {pending:'#fff3cd',processing:'#cce5ff',shipped:'#d4edda',delivered:'#d4edda',cancelled:'#f8d7da'};
+        const emailBody = `<p>Hi <strong>${custName}</strong>,</p>
+<p>There's an update on your order <strong>${or.order_number}</strong>.</p>
+<div style="margin:12px 0"><span class="status-chip" style="background:${statusBg[status]||'#f5f0e8'};color:${statusColors[status]||'#3d2b1f'}">${status}</span></div>
+<div class="msg-box"><p>${finalMsg}</p></div>
+${estimatedDelivery?`<p style="font-size:.82rem;color:#5a4238">📅 Estimated delivery: <strong>${new Date(estimatedDelivery).toLocaleDateString('en-ZA',{dateStyle:'long'})}</strong></p>`:''}`;
+        sendOrderEmail(toEmail, subj, emailTemplate(subj, emailBody, or.order_number, finalTrackingNum));
+        // Admin notification for new orders
+        if (status === 'delivered') {
+          sendAdminAlert(`Order Delivered: ${or.order_number}`, `<p>Order ${or.order_number} marked as delivered for ${custName}.</p>`);
+        }
+      }
+      res.json({ success: true, trackingNumber: finalTrackingNum });
     } catch(e) { await client.query('ROLLBACK'); throw e; }
     finally { client.release(); }
   } catch(e) { res.status(500).json({ error: e.message }); }
